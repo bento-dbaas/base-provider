@@ -4,10 +4,13 @@ from socket import timeout
 from .base import BaseProviderObject
 from .base import MongoClient
 
+from .errors import WaitInvalidStatus
+
 
 class BaseProvider(BaseProviderObject):
-    MAX_OPERATION_RETRY = 3
-    SECONDS_OPERATION_RETRY = 60
+    SECONDS_OPERATION_RETRY = 3
+    MAX_OPERATION_RETRY = (
+        SECONDS_OPERATION_RETRY * 10 * 100)
 
     def __init__(self, environment, engine=None, auth_info=None):
         super(BaseProvider, self).__init__()
@@ -63,18 +66,33 @@ class BaseProvider(BaseProviderObject):
         return self.get_provider()
 
     def wait_operation(self, operation=None, region=None, zone=None):
-        op = self._wait(
-            operation=operation,
-            region=region,
-            zone=zone
-        )
-        return self._check_operation_status(op)
+        operation_status = None
+        retry = 0
+
+        while retry <= self.MAX_OPERATION_RETRY:
+            try:
+                op = self._wait(
+                    operation=operation,
+                    region=region,
+                    zone=zone
+                )
+                operation_status = self._check_operation_status(op)
+            except Exception as ex:
+                if isinstance(ex, WaitInvalidStatus):
+                    sleep(self.SECONDS_OPERATION_RETRY)
+                    retry += 1
+                else:
+                    raise Exception(ex)
+            else:
+                return operation_status
+
+        raise EnvironmentError(
+                'Error while wait %s operation status' % operation)
 
     def _wait(self, operation, region=None, zone=None):
         if not operation:
             raise EnvironmentError('operation must be provided')
 
-        retry = 0
         if zone:
             op = self._get_wait_zone_operation(
                 zone=zone,
@@ -90,22 +108,10 @@ class BaseProvider(BaseProviderObject):
                 operation=operation
             )
 
-        while retry <= self.MAX_OPERATION_RETRY:
-            try:
-                operation = op.execute()
-            except Exception as ex:
-                if isinstance(ex, timeout):
-                    sleep(self.SECONDS_OPERATION_RETRY)
-                    retry += 1
-                else:
-                    raise Exception(ex)
-            else:
-                return operation
-
-        raise EnvironmentError('Error while wait %s operation' % operation)
+        return op.execute()
 
     def _get_wait_zone_operation(self, zone, operation, execute_request=False):
-        operation = self.client.zoneOperations().wait(
+        operation = self.client.zoneOperations().get(
             project=self.credential.project,
             zone=zone,
             operation=operation
@@ -118,7 +124,7 @@ class BaseProvider(BaseProviderObject):
 
     def _get_wait_region_operation(self, region, operation,
                                    execute_request=False):
-        operation = self.client.regionOperations().wait(
+        operation = self.client.regionOperations().get(
             project=self.credential.project,
             region=region,
             operation=operation
@@ -130,7 +136,7 @@ class BaseProvider(BaseProviderObject):
         return operation
 
     def _get_wait_global_operation(self, operation, execute_request=False):
-        operation = self.client.globalOperations().wait(
+        operation = self.client.globalOperations().get(
             project=self.credential.project,
             operation=operation
         )
@@ -148,11 +154,15 @@ class BaseProvider(BaseProviderObject):
             )
             raise Exception(error)
 
-        if operation.get('status') != 'DONE':
-            error = 'Operation {} is not Done. Status: {}'.format(
+        if operation.get('status') not in (
+           'UPLOADING', 'READY', 'DONE'):
+            error = 'Operation {} is waiting... Status: {}'.format(
                 operation.get('operationType'),
                 operation.get('status')
             )
-            raise Exception(error)
+
+            self.print_debug(error)
+
+            raise WaitInvalidStatus
 
         return True
